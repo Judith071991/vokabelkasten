@@ -1,5 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 
+const NEW_PER_DAY = 25; // muss zu train.js passen
+
 function ymd(d) {
   const x = new Date(d);
   const y = x.getFullYear();
@@ -17,7 +19,6 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Server-Konfiguration fehlt (Supabase Keys)." });
     }
 
-    // Admin-Client (Service Role) – nur serverseitig!
     const supabaseAdmin = createClient(url, serviceKey, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
@@ -26,13 +27,12 @@ export default async function handler(req, res) {
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
     if (!token) return res.status(401).json({ error: "Kein Token." });
 
-    // Token prüfen + User holen
     const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
     if (userErr || !userData?.user) return res.status(401).json({ error: "Token ungültig." });
 
     const adminUserId = userData.user.id;
 
-    // Ist der User Admin?
+    // Admin-Check
     const { data: adminRow, error: adminCheckErr } = await supabaseAdmin
       .from("admins")
       .select("user_id")
@@ -42,7 +42,7 @@ export default async function handler(req, res) {
     if (adminCheckErr) return res.status(500).json({ error: "Admin-Check fehlgeschlagen." });
     if (!adminRow) return res.status(403).json({ error: "Kein Admin-Zugriff." });
 
-    // Students holen
+    // Students
     const { data: students, error: stuErr } = await supabaseAdmin
       .from("students")
       .select("id, auth_user_id, username, display_name, class_name")
@@ -64,32 +64,33 @@ export default async function handler(req, res) {
     const result = [];
 
     for (const s of students || []) {
-      // Progress (Stage-Verteilung + fällig)
+      // Progress für Stage-Verteilung + due + neu-heute + meister
       const { data: progRows, error: progErr } = await supabaseAdmin
         .from("progress")
-        .select("stage, due_date")
+        .select("stage, due_date, first_seen_date")
         .eq("user_id", s.auth_user_id);
 
       if (progErr) {
-        result.push({
-          student: s,
-          error: "progress_error",
-        });
+        result.push({ student: s, error: "progress_error" });
         continue;
       }
 
       const stageCounts = [0, 0, 0, 0, 0];
       let dueNow = 0;
+      let newToday = 0;
 
       for (const p of progRows || []) {
         const st = typeof p.stage === "number" ? p.stage : 0;
         if (st >= 0 && st <= 4) stageCounts[st] += 1;
 
         if (p.due_date && String(p.due_date) <= todayStr) dueNow += 1;
+        if (p.first_seen_date && String(p.first_seen_date) === todayStr) newToday += 1;
       }
 
       const totalCards = stageCounts.reduce((a, b) => a + b, 0);
       const mastered = stageCounts[4];
+      const progressPct = totalCards > 0 ? Math.round((mastered / totalCards) * 100) : 0;
+      const newRemainingToday = Math.max(0, NEW_PER_DAY - newToday);
 
       // Practice Sessions (letzte 30 Tage) → pro Tag aggregieren
       const { data: sessRows, error: sessErr } = await supabaseAdmin
@@ -99,56 +100,38 @@ export default async function handler(req, res) {
         .gte("started_at", since30ISO)
         .order("started_at", { ascending: false });
 
-      if (sessErr) {
-        result.push({
-          student: s,
-          totalCards,
-          stageCounts,
-          dueNow,
-          mastered,
-          activity: { days: [], lastPracticeAt: null, minutes7d: 0, daysPracticed7d: 0 },
-        });
-        continue;
-      }
-
-      // Tages-Aggregation
-      const dayMap = new Map(); // ymd -> {date, seconds, cards, correct, wrong}
+      let days = [];
       let lastPracticeAt = null;
+      let minutes7d = 0;
+      let daysPracticed7d = 0;
 
-      for (const r of sessRows || []) {
-        const key = ymd(r.started_at || r.last_activity_at || new Date().toISOString());
-        const prev = dayMap.get(key) || {
-          date: key,
-          seconds: 0,
-          cards: 0,
-          correct: 0,
-          wrong: 0,
-        };
+      if (!sessErr) {
+        const dayMap = new Map();
+        for (const r of sessRows || []) {
+          const key = ymd(r.started_at || r.last_activity_at || new Date().toISOString());
+          const prev = dayMap.get(key) || { date: key, seconds: 0, cards: 0, correct: 0, wrong: 0 };
+          prev.seconds += Number(r.duration_seconds || 0);
+          prev.cards += Number(r.cards_answered || 0);
+          prev.correct += Number(r.correct_answers || 0);
+          prev.wrong += Number(r.wrong_answers || 0);
+          dayMap.set(key, prev);
 
-        prev.seconds += Number(r.duration_seconds || 0);
-        prev.cards += Number(r.cards_answered || 0);
-        prev.correct += Number(r.correct_answers || 0);
-        prev.wrong += Number(r.wrong_answers || 0);
-
-        dayMap.set(key, prev);
-
-        if (!lastPracticeAt) {
-          lastPracticeAt = r.last_activity_at || r.ended_at || r.started_at || null;
+          if (!lastPracticeAt) lastPracticeAt = r.last_activity_at || r.ended_at || r.started_at || null;
         }
-      }
+        days = Array.from(dayMap.values()).sort((a, b) => (a.date < b.date ? 1 : -1));
 
-      const days = Array.from(dayMap.values()).sort((a, b) => (a.date < b.date ? 1 : -1));
-
-      // 7 Tage Summe
-      let seconds7d = 0;
-      const practiced7dSet = new Set();
-      for (const r of sessRows || []) {
-        const sa = r.started_at || r.last_activity_at;
-        if (!sa) continue;
-        if (new Date(sa).toISOString() >= since7ISO) {
-          seconds7d += Number(r.duration_seconds || 0);
-          practiced7dSet.add(ymd(sa));
+        const practiced7dSet = new Set();
+        let seconds7d = 0;
+        for (const r of sessRows || []) {
+          const sa = r.started_at || r.last_activity_at;
+          if (!sa) continue;
+          if (new Date(sa).toISOString() >= since7ISO) {
+            seconds7d += Number(r.duration_seconds || 0);
+            practiced7dSet.add(ymd(sa));
+          }
         }
+        minutes7d = Math.round(seconds7d / 60);
+        daysPracticed7d = practiced7dSet.size;
       }
 
       result.push({
@@ -157,16 +140,14 @@ export default async function handler(req, res) {
         stageCounts,
         dueNow,
         mastered,
-        activity: {
-          days, // letzte 30 Tage (aggregiert)
-          lastPracticeAt,
-          minutes7d: Math.round(seconds7d / 60),
-          daysPracticed7d: practiced7dSet.size,
-        },
+        progressPct,
+        newToday,
+        newRemainingToday,
+        activity: { days, lastPracticeAt, minutes7d, daysPracticed7d },
       });
     }
 
-    return res.status(200).json({ today: todayStr, students: result });
+    return res.status(200).json({ today: todayStr, newPerDay: NEW_PER_DAY, students: result });
   } catch (e) {
     return res.status(500).json({ error: "Serverfehler." });
   }
