@@ -55,8 +55,8 @@ export default function Train() {
     let t = normalize(text);
     t = t.replace(/\bim\b/g, "i am");
     t = t.replace(/\bi'm\b/g, "i am");
-    t = t.replace(/\bi’m\b/g, "i am"); // falls typografisch drin bleibt
-    t = t.replace(/'/g, "");
+    t = t.replace(/\bi’m\b/g, "i am");
+    t = t.replace(/'/g, ""); // apostroph egal
     return t;
   }
 
@@ -80,7 +80,7 @@ export default function Train() {
     return dp[m][n];
   }
 
-  // Step 2: Mehrere Lösungen erlauben:
+  // Schritt 2: Mehrere Lösungen erlauben:
   // current.english kann Varianten enthalten, getrennt durch ';'
   function splitSolutions(englishField) {
     return String(englishField || "")
@@ -93,13 +93,12 @@ export default function Train() {
     const given = canonical(givenRaw);
     const solutionsRaw = splitSolutions(englishField);
 
-    // Erst: exakter Match nach canonical gegen irgendeine Lösung
+    // 1) exakter Match (nach canonical) gegen irgendeine Lösung
     for (const sol of solutionsRaw) {
       if (given === canonical(sol)) return true;
     }
 
-    // Dann: 1 Tippfehler erlauben (nur wenn nicht zu kurz)
-    // Damit "to" nicht versehentlich alles matcht.
+    // 2) 1 Tippfehler erlauben (nur wenn nicht zu kurz)
     for (const sol of solutionsRaw) {
       const s = canonical(sol);
       const minLen = Math.min(given.length, s.length);
@@ -157,7 +156,6 @@ export default function Train() {
       .limit(20);
 
     if (error) return setMsg("Fehler beim Laden.");
-
     const mapped = (data || []).map((p) => ({
       progress_id: p.id,
       stage: p.stage,
@@ -230,7 +228,6 @@ export default function Train() {
 
     const correct = isCorrectAnswer(answer, current.english);
 
-    // Für Feedback: zeige erste Lösung (oder ganze Liste)
     const solutions = splitSolutions(current.english);
     const shownSolution = solutions[0] || current.english;
 
@@ -274,10 +271,31 @@ export default function Train() {
   }
 
   // -------------------------
-  // UI (Schritt 3: Stufe anzeigen)
+  // UI-Helfer: Kasten-Badge + Mini-Balken + Meister
   // -------------------------
 
-  const stageLabel = current ? `Kasten ${current.stage + 1} / 5` : "";
+  function stageUI(stageRaw) {
+    const stage = typeof stageRaw === "number" ? stageRaw : 0; // 0..4
+    const boxNum = Math.min(5, Math.max(1, stage + 1)); // 1..5
+    const pct = ((boxNum - 1) / 4) * 100; // 0..100
+
+    const bg =
+      stage === 0
+        ? "#f8d7da" // rot
+        : stage === 1
+        ? "#fff3cd" // gelb
+        : stage === 2
+        ? "#d1ecf1" // blau
+        : stage === 3
+        ? "#d4edda" // grün
+        : "#c3e6cb"; // grün+
+
+    const title = stage === 4 ? `🏆 Meister (Kasten ${boxNum}/5)` : `📦 Kasten ${boxNum} von 5`;
+
+    return { stage, boxNum, pct, bg, title };
+  }
+
+  const ui = stageUI(current?.stage);
 
   return (
     <main style={{ maxWidth: 720, margin: "40px auto", fontFamily: "system-ui" }}>
@@ -286,25 +304,53 @@ export default function Train() {
         <button onClick={logout}>Logout</button>
       </div>
 
-      <p style={{ color: "#666" }}>
-        {cards.length ? `Karte ${idx + 1} von ${cards.length}` : ""}
-        {current ? ` • ${stageLabel}` : ""}
-      </p>
-
+      <p style={{ color: "#666" }}>{cards.length ? `Karte ${idx + 1} von ${cards.length}` : ""}</p>
       {msg && <p style={{ color: "#0a6" }}>{msg}</p>}
 
       {current && (
         <div style={{ border: "1px solid #ddd", padding: 16, borderRadius: 10 }}>
-        <div
-  style={{
-    fontSize: 14,
-    fontWeight: 600,
-    color: "#666",
-    marginBottom: 8
-  }}
->
-  Kasten {current.stage + 1} von 5
-</div>
+          {/* Badge + Mini-Fortschrittsbalken */}
+          <div style={{ marginBottom: 12 }}>
+            <div
+              style={{
+                display: "inline-block",
+                padding: "6px 12px",
+                borderRadius: 20,
+                background: ui.bg,
+                color: "#333",
+                fontWeight: 800,
+                fontSize: 14,
+                marginBottom: 10,
+              }}
+            >
+              {ui.title}
+            </div>
+
+            <div
+              style={{
+                height: 8,
+                background: "#eee",
+                borderRadius: 999,
+                overflow: "hidden",
+              }}
+              aria-label="Fortschritt Kasten"
+            >
+              <div
+                style={{
+                  height: "100%",
+                  width: `${ui.pct}%`,
+                  background: ui.bg,
+                }}
+              />
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, color: "#777", fontSize: 12 }}>
+              <span>Kasten 1</span>
+              <span>Kasten 5</span>
+            </div>
+          </div>
+
+          {/* Deutsch (gelb bei Redewendung) */}
           <div
             style={{
               background: current.is_idiom ? "#fff3b0" : "transparent",
@@ -332,7 +378,7 @@ export default function Train() {
             </button>
           ) : (
             <div style={{ marginTop: 12 }}>
-              <p style={{ fontWeight: 700, color: feedback.correct ? "#0a6" : "#b00" }}>
+              <p style={{ fontWeight: 800, color: feedback.correct ? "#0a6" : "#b00" }}>
                 {feedback.correct ? "Richtig ✅" : "Falsch ❌"}
               </p>
 
@@ -343,8 +389,7 @@ export default function Train() {
                   </p>
                   {feedback.allSolutions?.length > 1 && (
                     <p style={{ color: "#666", marginTop: 6 }}>
-                      Weitere akzeptierte Lösungen:{" "}
-                      <b>{feedback.allSolutions.slice(1).join(" • ")}</b>
+                      Weitere akzeptierte Lösungen: <b>{feedback.allSolutions.slice(1).join(" • ")}</b>
                     </p>
                   )}
                 </>
