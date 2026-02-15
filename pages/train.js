@@ -26,9 +26,10 @@ export default function Train() {
   const [feedback, setFeedback] = useState(null);
   const [sessionId, setSessionId] = useState(null);
 
-  // neu-heute / Fortschritt
-  const [newRemainingToday, setNewRemainingToday] = useState(0);
-  const [progressPct, setProgressPct] = useState(0);
+  // Anzeige oben
+  const [newRemainingToday, setNewRemainingToday] = useState(NEW_PER_DAY);
+  const [learnedPct, setLearnedPct] = useState(0);     // stage > 0
+  const [masterPct, setMasterPct] = useState(0);       // stage == 4
   const [masteredCount, setMasteredCount] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
 
@@ -41,8 +42,8 @@ export default function Train() {
       setUser(data.session.user);
 
       await ensureProgressInitialized(data.session.user.id);
-      await refreshCounters(data.session.user.id);
 
+      // Session starten
       const { data: sess, error: sessErr } = await supabase
         .from("practice_sessions")
         .insert({ user_id: data.session.user.id })
@@ -50,13 +51,13 @@ export default function Train() {
         .single();
       if (!sessErr) setSessionId(sess.id);
 
-      await loadDueCards();
+      await loadDueCards(data.session.user.id);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // -------------------------
-  // Vergleichslogik (tolerant + Varianten + 1 Tippfehler)
+  // Vergleich (tolerant + Varianten + 1 Tippfehler)
   // -------------------------
   function normalize(text) {
     return (text || "")
@@ -147,12 +148,13 @@ export default function Train() {
   }
 
   // -------------------------
-  // Counter: neu-heute + Fortschritt%
+  // Counter: neu-heute + Fortschritt (Gelernt & Meister)
+  // -> WICHTIG: gibt Werte zurück, damit loadDueCards sie sofort nutzen kann
   // -------------------------
   async function refreshCounters(userId) {
     const today = todayYMD();
 
-    // wie viele neue Karten wurden heute "zum ersten Mal" gesehen?
+    // neu heute = first_seen_date == heute
     const { count: newToday } = await supabase
       .from("progress")
       .select("*", { count: "exact", head: true })
@@ -162,29 +164,43 @@ export default function Train() {
     const remaining = Math.max(0, NEW_PER_DAY - (newToday || 0));
     setNewRemainingToday(remaining);
 
-    // Fortschritt: stage 4 / total
+    // total
     const { count: total } = await supabase
       .from("progress")
       .select("*", { count: "exact", head: true })
       .eq("user_id", userId);
 
+    // meister (stage 4)
     const { count: mastered } = await supabase
       .from("progress")
       .select("*", { count: "exact", head: true })
       .eq("user_id", userId)
       .eq("stage", 4);
 
+    // gelernt (stage > 0) – steigt sofort nach dem ersten Üben
+    const { count: learned } = await supabase
+      .from("progress")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .gt("stage", 0);
+
     const t = total || 0;
     const m = mastered || 0;
+    const l = learned || 0;
+
     setTotalCount(t);
     setMasteredCount(m);
-    setProgressPct(t > 0 ? Math.round((m / t) * 100) : 0);
+
+    setMasterPct(t > 0 ? Math.round((m / t) * 100) : 0);
+    setLearnedPct(t > 0 ? Math.round((l / t) * 100) : 0);
+
+    return { remaining };
   }
 
   // -------------------------
-  // Laden: erst Wiederholungen, dann neue (aber max. "neu heute")
+  // Laden: erst Wiederholungen, dann neue (max "neu heute")
   // -------------------------
-  async function loadDueCards() {
+  async function loadDueCards(userIdOverride) {
     setMsg("");
     setFeedback(null);
     setAnswer("");
@@ -192,15 +208,17 @@ export default function Train() {
 
     const today = todayYMD();
 
-    const { data: session } = await supabase.auth.getSession();
-    const uid = session?.session?.user?.id;
+    const uid = userIdOverride || user?.id;
+    if (!uid) return;
 
-    if (uid) await refreshCounters(uid);
+    // Fix: remaining direkt von refreshCounters nehmen (nicht aus altem State)
+    const { remaining } = await refreshCounters(uid);
 
     // 1) Wiederholungen (stage > 0)
     const { data: rev, error: revErr } = await supabase
       .from("progress")
       .select("id, stage, due_date, correct_count, wrong_count, first_seen_date, vocab: vocab_id (id, german, english, is_idiom)")
+      .eq("user_id", uid)
       .lte("due_date", today)
       .gt("stage", 0)
       .order("due_date", { ascending: true })
@@ -225,15 +243,16 @@ export default function Train() {
 
     // 2) Neue Karten (stage = 0), aber nur bis "neu heute" voll ist
     let mappedNew = [];
-    const allowNew = Math.min(remainingSlots, newRemainingToday);
+    const allowNew = Math.min(remainingSlots, remaining);
 
     if (allowNew > 0) {
       const { data: neu, error: newErr } = await supabase
         .from("progress")
         .select("id, stage, due_date, correct_count, wrong_count, first_seen_date, vocab: vocab_id (id, german, english, is_idiom)")
+        .eq("user_id", uid)
         .lte("due_date", today)
         .eq("stage", 0)
-        .is("first_seen_date", null) // wirklich noch nie gesehen
+        .is("first_seen_date", null)
         .order("due_date", { ascending: true })
         .limit(allowNew);
 
@@ -318,9 +337,7 @@ export default function Train() {
 
     const today = todayYMD();
 
-    // first_seen_date setzen, wenn es eine "neue" Karte ist und noch nie gesehen wurde
     const setFirstSeen = current.first_seen_date ? {} : { first_seen_date: today };
-
     const { newStage, due_date } = nextStageAndDue(current.stage, correct);
 
     await supabase
@@ -336,7 +353,6 @@ export default function Train() {
       .eq("id", current.progress_id);
 
     await markActivity(correct);
-
     if (user?.id) await refreshCounters(user.id);
   }
 
@@ -347,7 +363,7 @@ export default function Train() {
     else {
       setMsg("Session fertig ✅");
       await endSession();
-      await loadDueCards();
+      if (user?.id) await loadDueCards(user.id);
     }
   }
 
@@ -357,7 +373,6 @@ export default function Train() {
     router.push("/");
   }
 
-  // UI: Badge + Balken + Meister
   function stageUI(stageRaw) {
     const stage = typeof stageRaw === "number" ? stageRaw : 0;
     const boxNum = Math.min(5, Math.max(1, stage + 1));
@@ -384,8 +399,10 @@ export default function Train() {
       <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", color: "#666" }}>
         <div>{cards.length ? `Karte ${idx + 1} von ${cards.length}` : ""}</div>
         <div>
-          Heute noch <b>{newRemainingToday}</b> neue Karten • Fortschritt: <b>{progressPct}%</b>{" "}
-          <span style={{ color: "#888" }}>({masteredCount}/{totalCount} Meister)</span>
+          Heute noch <b>{newRemainingToday}</b> neue Karten •
+          Gelernt: <b>{learnedPct}%</b> •
+          Meister: <b>{masterPct}%</b>{" "}
+          <span style={{ color: "#888" }}>({masteredCount}/{totalCount})</span>
         </div>
       </div>
 
@@ -446,7 +463,7 @@ export default function Train() {
       )}
 
       <div style={{ marginTop: 16 }}>
-        <button onClick={loadDueCards} style={{ padding: "10px 14px" }}>Fällige neu laden</button>{" "}
+        <button onClick={() => loadDueCards(user?.id)} style={{ padding: "10px 14px" }}>Fällige neu laden</button>{" "}
         <a href="/admin" style={{ marginLeft: 10 }}>Admin</a>
       </div>
     </main>
