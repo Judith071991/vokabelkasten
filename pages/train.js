@@ -111,29 +111,38 @@ export default function Train() {
   }
 
   async function check() {
-    if (!current) return;
+  if (!current) return;
 
-    const given = answer.trim().toLowerCase();
-    const solution = current.english.trim().toLowerCase();
-    const correct = given === solution;
-
-    setFeedback({ correct, solution: current.english });
-
-    const { newStage, due_date } = nextStageAndDue(current.stage, correct);
-
-    await supabase
-      .from("progress")
-      .update({
-        stage: newStage,
-        due_date,
-        last_seen: todayYMD(),
-        correct_count: (current.correct_count || 0) + (correct ? 1 : 0),
-        wrong_count: (current.wrong_count || 0) + (correct ? 0 : 1),
-      })
-      .eq("id", current.progress_id);
-
-    await markActivity(correct);
+  function normalize(text) {
+    return (text || "")
+      .toLowerCase()
+      .replace(/[’‘]/g, "'")     // geschwungene Apostrophe → '
+      .replace(/[“”]/g, '"')     // geschwungene Anführungszeichen → "
+      .replace(/\s+/g, " ")      // mehrere Leerzeichen → eins
+      .trim();
   }
+
+  const given = normalize(answer);
+  const solution = normalize(current.english);
+  const correct = given === solution;
+
+  setFeedback({ correct, solution: current.english });
+
+  const { newStage, due_date } = nextStageAndDue(current.stage, correct);
+
+  await supabase
+    .from("progress")
+    .update({
+      stage: newStage,
+      due_date,
+      last_seen: todayYMD(),
+      correct_count: (current.correct_count || 0) + (correct ? 1 : 0),
+      wrong_count: (current.wrong_count || 0) + (correct ? 0 : 1),
+    })
+    .eq("id", current.progress_id);
+
+  await markActivity(correct);
+}
 
   async function next() {
     setFeedback(null);
