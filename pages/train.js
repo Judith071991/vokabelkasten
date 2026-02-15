@@ -3,6 +3,19 @@ import { supabase } from "../lib/supabaseClient";
 import { nextStageAndDue, todayYMD } from "../lib/srs";
 import { useRouter } from "next/router";
 
+const NEW_PER_DAY = 25;        // 👈 hier: 20–30 empfehlenswert
+const SESSION_LIMIT = 20;      // 👈 wie viele Karten pro Session angezeigt werden
+
+function addDaysYMD(ymd, days) {
+  const [y, m, d] = ymd.split("-").map((x) => parseInt(x, 10));
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
+}
+
 export default function Train() {
   const router = useRouter();
   const [user, setUser] = useState(null);
@@ -42,28 +55,23 @@ export default function Train() {
   function normalize(text) {
     return (text || "")
       .toLowerCase()
-      .replace(/[’‘]/g, "'") // geschwungene Apostrophe → '
-      .replace(/[“”]/g, '"') // geschwungene Anführungszeichen → "
-      .replace(/\s+/g, " ") // mehrere Leerzeichen → eins
+      .replace(/[’‘]/g, "'")
+      .replace(/[“”]/g, '"')
+      .replace(/\s+/g, " ")
       .trim();
   }
 
-  // Canonical: macht Varianten möglichst gleich
-  // - i'm / i’m / im / i am → i am
-  // - apostrophe egal
   function canonical(text) {
     let t = normalize(text);
     t = t.replace(/\bim\b/g, "i am");
     t = t.replace(/\bi'm\b/g, "i am");
     t = t.replace(/\bi’m\b/g, "i am");
-    t = t.replace(/'/g, ""); // apostroph egal
+    t = t.replace(/'/g, "");
     return t;
   }
 
-  // Levenshtein-Distanz (für 1 kleinen Tippfehler)
   function levenshtein(a, b) {
-    const m = a.length,
-      n = b.length;
+    const m = a.length, n = b.length;
     const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
     for (let i = 0; i <= m; i++) dp[i][0] = i;
     for (let j = 0; j <= n; j++) dp[0][j] = j;
@@ -80,8 +88,6 @@ export default function Train() {
     return dp[m][n];
   }
 
-  // Schritt 2: Mehrere Lösungen erlauben:
-  // current.english kann Varianten enthalten, getrennt durch ';'
   function splitSolutions(englishField) {
     return String(englishField || "")
       .split(";")
@@ -93,12 +99,10 @@ export default function Train() {
     const given = canonical(givenRaw);
     const solutionsRaw = splitSolutions(englishField);
 
-    // 1) exakter Match (nach canonical) gegen irgendeine Lösung
     for (const sol of solutionsRaw) {
       if (given === canonical(sol)) return true;
     }
 
-    // 2) 1 Tippfehler erlauben (nur wenn nicht zu kurz)
     for (const sol of solutionsRaw) {
       const s = canonical(sol);
       const minLen = Math.min(given.length, s.length);
@@ -112,7 +116,7 @@ export default function Train() {
   }
 
   // -------------------------
-  // Datenladen / Setup
+  // Setup: Progress initialisieren (NEU: Neue Karten über Tage verteilen)
   // -------------------------
 
   async function ensureProgressInitialized(userId) {
@@ -123,20 +127,34 @@ export default function Train() {
 
     if (count && count > 0) return;
 
-    const { data: vocab } = await supabase.from("vocab").select("id");
+    // Wichtig: Reihenfolge bestimmt, welche Karten zuerst kommen.
+    // Wenn deine Vokabeln in 'vocab' nach Tag 1..30 eingefügt wurden, passt "order('id')" gut.
+    const { data: vocab } = await supabase
+      .from("vocab")
+      .select("id")
+      .order("id", { ascending: true });
+
     if (!vocab?.length) return;
 
+    const start = todayYMD();
+
     const batchSize = 200;
-    for (let i = 0; i < vocab.length; i += batchSize) {
-      const batch = vocab.slice(i, i + batchSize).map((v) => ({
-        user_id: userId,
-        vocab_id: v.id,
-        stage: 0,
-        due_date: todayYMD(),
-      }));
-      await supabase.from("progress").insert(batch);
+    const rows = vocab.map((v, i) => ({
+      user_id: userId,
+      vocab_id: v.id,
+      stage: 0,
+      // 👇 verteilt: 25 neue pro Tag
+      due_date: addDaysYMD(start, Math.floor(i / NEW_PER_DAY)),
+    }));
+
+    for (let i = 0; i < rows.length; i += batchSize) {
+      await supabase.from("progress").insert(rows.slice(i, i + batchSize));
     }
   }
+
+  // -------------------------
+  // Laden: erst Wiederholungen, dann neue Karten auffüllen (NEU)
+  // -------------------------
 
   async function loadDueCards() {
     setMsg("");
@@ -146,17 +164,20 @@ export default function Train() {
 
     const today = todayYMD();
 
-    const { data, error } = await supabase
+    // 1) Wiederholungen (stage > 0)
+    const { data: rev, error: revErr } = await supabase
       .from("progress")
       .select(
         "id, stage, due_date, correct_count, wrong_count, vocab: vocab_id (id, german, english, is_idiom)"
       )
       .lte("due_date", today)
+      .gt("stage", 0)
       .order("due_date", { ascending: true })
-      .limit(20);
+      .limit(SESSION_LIMIT);
 
-    if (error) return setMsg("Fehler beim Laden.");
-    const mapped = (data || []).map((p) => ({
+    if (revErr) return setMsg("Fehler beim Laden.");
+
+    const mappedRev = (rev || []).map((p) => ({
       progress_id: p.id,
       stage: p.stage,
       due_date: p.due_date,
@@ -168,12 +189,43 @@ export default function Train() {
       is_idiom: p.vocab.is_idiom,
     }));
 
-    setCards(mapped);
-    if (!mapped.length) setMsg("Heute ist nichts fällig 🎉");
+    // 2) Neue Karten (stage = 0), aber nur bis Session-Limit voll ist
+    const remaining = SESSION_LIMIT - mappedRev.length;
+
+    let mappedNew = [];
+    if (remaining > 0) {
+      const { data: neu, error: newErr } = await supabase
+        .from("progress")
+        .select(
+          "id, stage, due_date, correct_count, wrong_count, vocab: vocab_id (id, german, english, is_idiom)"
+        )
+        .lte("due_date", today)
+        .eq("stage", 0)
+        .order("due_date", { ascending: true })
+        .limit(remaining);
+
+      if (newErr) return setMsg("Fehler beim Laden.");
+
+      mappedNew = (neu || []).map((p) => ({
+        progress_id: p.id,
+        stage: p.stage,
+        due_date: p.due_date,
+        correct_count: p.correct_count,
+        wrong_count: p.wrong_count,
+        vocab_id: p.vocab.id,
+        german: p.vocab.german,
+        english: p.vocab.english,
+        is_idiom: p.vocab.is_idiom,
+      }));
+    }
+
+    const combined = [...mappedRev, ...mappedNew];
+    setCards(combined);
+    if (!combined.length) setMsg("Heute ist nichts fällig 🎉");
   }
 
   // -------------------------
-  // Session Tracking (Übungszeit)
+  // Session Tracking
   // -------------------------
 
   async function markActivity(correct) {
@@ -220,7 +272,7 @@ export default function Train() {
   }
 
   // -------------------------
-  // Training: Prüfen / Nächste / Logout
+  // Training
   // -------------------------
 
   async function check() {
@@ -271,28 +323,24 @@ export default function Train() {
   }
 
   // -------------------------
-  // UI-Helfer: Kasten-Badge + Mini-Balken + Meister
+  // UI: Kasten-Badge + Balken + Meister
   // -------------------------
 
   function stageUI(stageRaw) {
     const stage = typeof stageRaw === "number" ? stageRaw : 0; // 0..4
-    const boxNum = Math.min(5, Math.max(1, stage + 1)); // 1..5
-    const pct = ((boxNum - 1) / 4) * 100; // 0..100
+    const boxNum = Math.min(5, Math.max(1, stage + 1));
+    const pct = ((boxNum - 1) / 4) * 100;
 
     const bg =
-      stage === 0
-        ? "#f8d7da" // rot
-        : stage === 1
-        ? "#fff3cd" // gelb
-        : stage === 2
-        ? "#d1ecf1" // blau
-        : stage === 3
-        ? "#d4edda" // grün
-        : "#c3e6cb"; // grün+
+      stage === 0 ? "#f8d7da" :
+      stage === 1 ? "#fff3cd" :
+      stage === 2 ? "#d1ecf1" :
+      stage === 3 ? "#d4edda" :
+      "#c3e6cb";
 
     const title = stage === 4 ? `🏆 Meister (Kasten ${boxNum}/5)` : `📦 Kasten ${boxNum} von 5`;
 
-    return { stage, boxNum, pct, bg, title };
+    return { bg, pct, title };
   }
 
   const ui = stageUI(current?.stage);
@@ -309,7 +357,6 @@ export default function Train() {
 
       {current && (
         <div style={{ border: "1px solid #ddd", padding: 16, borderRadius: 10 }}>
-          {/* Badge + Mini-Fortschrittsbalken */}
           <div style={{ marginBottom: 12 }}>
             <div
               style={{
@@ -326,22 +373,8 @@ export default function Train() {
               {ui.title}
             </div>
 
-            <div
-              style={{
-                height: 8,
-                background: "#eee",
-                borderRadius: 999,
-                overflow: "hidden",
-              }}
-              aria-label="Fortschritt Kasten"
-            >
-              <div
-                style={{
-                  height: "100%",
-                  width: `${ui.pct}%`,
-                  background: ui.bg,
-                }}
-              />
+            <div style={{ height: 8, background: "#eee", borderRadius: 999, overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${ui.pct}%`, background: ui.bg }} />
             </div>
 
             <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, color: "#777", fontSize: 12 }}>
@@ -350,7 +383,6 @@ export default function Train() {
             </div>
           </div>
 
-          {/* Deutsch (gelb bei Redewendung) */}
           <div
             style={{
               background: current.is_idiom ? "#fff3b0" : "transparent",
