@@ -3,7 +3,7 @@ import { supabase } from "../lib/supabaseClient";
 import { nextStageAndDue, todayYMD } from "../lib/srs";
 import { useRouter } from "next/router";
 
-const NEW_PER_DAY = 25;        // 20–30 sinnvoll
+const NEW_PER_DAY = 25;   // 20–30
 const SESSION_LIMIT = 20;
 
 function addDaysYMD(ymd, days) {
@@ -26,6 +26,12 @@ export default function Train() {
   const [feedback, setFeedback] = useState(null);
   const [sessionId, setSessionId] = useState(null);
 
+  // neu-heute / Fortschritt
+  const [newRemainingToday, setNewRemainingToday] = useState(0);
+  const [progressPct, setProgressPct] = useState(0);
+  const [masteredCount, setMasteredCount] = useState(0);
+  const [totalCount, setTotalCount] = useState(0);
+
   const current = useMemo(() => cards[idx] || null, [cards, idx]);
 
   useEffect(() => {
@@ -35,6 +41,7 @@ export default function Train() {
       setUser(data.session.user);
 
       await ensureProgressInitialized(data.session.user.id);
+      await refreshCounters(data.session.user.id);
 
       const { data: sess, error: sessErr } = await supabase
         .from("practice_sessions")
@@ -48,7 +55,9 @@ export default function Train() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // -------- Vergleichslogik (tolerant + Varianten + 1 Tippfehler) --------
+  // -------------------------
+  // Vergleichslogik (tolerant + Varianten + 1 Tippfehler)
+  // -------------------------
   function normalize(text) {
     return (text || "")
       .toLowerCase()
@@ -57,6 +66,7 @@ export default function Train() {
       .replace(/\s+/g, " ")
       .trim();
   }
+
   function canonical(text) {
     let t = normalize(text);
     t = t.replace(/\bim\b/g, "i am");
@@ -65,6 +75,7 @@ export default function Train() {
     t = t.replace(/'/g, "");
     return t;
   }
+
   function levenshtein(a, b) {
     const m = a.length, n = b.length;
     const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
@@ -78,12 +89,14 @@ export default function Train() {
     }
     return dp[m][n];
   }
+
   function splitSolutions(englishField) {
     return String(englishField || "")
       .split(";")
       .map((s) => s.trim())
       .filter(Boolean);
   }
+
   function isCorrectAnswer(givenRaw, englishField) {
     const given = canonical(givenRaw);
     const solutionsRaw = splitSolutions(englishField);
@@ -98,7 +111,9 @@ export default function Train() {
     return false;
   }
 
-  // -------- Setup: Progress initialisieren (NEU: Tag 1→30 zuerst) --------
+  // -------------------------
+  // Setup: Progress initialisieren (Tag-Reihenfolge, 25/Tag)
+  // -------------------------
   async function ensureProgressInitialized(userId) {
     const { count } = await supabase
       .from("progress")
@@ -107,8 +122,6 @@ export default function Train() {
 
     if (count && count > 0) return;
 
-    // Tag-Reihenfolge: day asc (nulls last), dann id
-    // Falls day noch leer ist, fällt er automatisch zurück auf id-Reihenfolge.
     const { data: vocab } = await supabase
       .from("vocab")
       .select("id, day")
@@ -125,6 +138,7 @@ export default function Train() {
       vocab_id: v.id,
       stage: 0,
       due_date: addDaysYMD(start, Math.floor(i / NEW_PER_DAY)),
+      first_seen_date: null,
     }));
 
     for (let i = 0; i < rows.length; i += batchSize) {
@@ -132,7 +146,44 @@ export default function Train() {
     }
   }
 
-  // -------- Laden: erst Wiederholungen, dann neue Karten --------
+  // -------------------------
+  // Counter: neu-heute + Fortschritt%
+  // -------------------------
+  async function refreshCounters(userId) {
+    const today = todayYMD();
+
+    // wie viele neue Karten wurden heute "zum ersten Mal" gesehen?
+    const { count: newToday } = await supabase
+      .from("progress")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("first_seen_date", today);
+
+    const remaining = Math.max(0, NEW_PER_DAY - (newToday || 0));
+    setNewRemainingToday(remaining);
+
+    // Fortschritt: stage 4 / total
+    const { count: total } = await supabase
+      .from("progress")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId);
+
+    const { count: mastered } = await supabase
+      .from("progress")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("stage", 4);
+
+    const t = total || 0;
+    const m = mastered || 0;
+    setTotalCount(t);
+    setMasteredCount(m);
+    setProgressPct(t > 0 ? Math.round((m / t) * 100) : 0);
+  }
+
+  // -------------------------
+  // Laden: erst Wiederholungen, dann neue (aber max. "neu heute")
+  // -------------------------
   async function loadDueCards() {
     setMsg("");
     setFeedback(null);
@@ -141,9 +192,15 @@ export default function Train() {
 
     const today = todayYMD();
 
+    const { data: session } = await supabase.auth.getSession();
+    const uid = session?.session?.user?.id;
+
+    if (uid) await refreshCounters(uid);
+
+    // 1) Wiederholungen (stage > 0)
     const { data: rev, error: revErr } = await supabase
       .from("progress")
-      .select("id, stage, due_date, correct_count, wrong_count, vocab: vocab_id (id, german, english, is_idiom)")
+      .select("id, stage, due_date, correct_count, wrong_count, first_seen_date, vocab: vocab_id (id, german, english, is_idiom)")
       .lte("due_date", today)
       .gt("stage", 0)
       .order("due_date", { ascending: true })
@@ -157,23 +214,28 @@ export default function Train() {
       due_date: p.due_date,
       correct_count: p.correct_count,
       wrong_count: p.wrong_count,
+      first_seen_date: p.first_seen_date,
       vocab_id: p.vocab.id,
       german: p.vocab.german,
       english: p.vocab.english,
       is_idiom: p.vocab.is_idiom,
     }));
 
-    const remaining = SESSION_LIMIT - mappedRev.length;
+    const remainingSlots = SESSION_LIMIT - mappedRev.length;
 
+    // 2) Neue Karten (stage = 0), aber nur bis "neu heute" voll ist
     let mappedNew = [];
-    if (remaining > 0) {
+    const allowNew = Math.min(remainingSlots, newRemainingToday);
+
+    if (allowNew > 0) {
       const { data: neu, error: newErr } = await supabase
         .from("progress")
-        .select("id, stage, due_date, correct_count, wrong_count, vocab: vocab_id (id, german, english, is_idiom)")
+        .select("id, stage, due_date, correct_count, wrong_count, first_seen_date, vocab: vocab_id (id, german, english, is_idiom)")
         .lte("due_date", today)
         .eq("stage", 0)
+        .is("first_seen_date", null) // wirklich noch nie gesehen
         .order("due_date", { ascending: true })
-        .limit(remaining);
+        .limit(allowNew);
 
       if (newErr) return setMsg("Fehler beim Laden.");
 
@@ -183,6 +245,7 @@ export default function Train() {
         due_date: p.due_date,
         correct_count: p.correct_count,
         wrong_count: p.wrong_count,
+        first_seen_date: p.first_seen_date,
         vocab_id: p.vocab.id,
         german: p.vocab.german,
         english: p.vocab.english,
@@ -195,7 +258,9 @@ export default function Train() {
     if (!combined.length) setMsg("Heute ist nichts fällig 🎉");
   }
 
-  // -------- Session Tracking --------
+  // -------------------------
+  // Session Tracking
+  // -------------------------
   async function markActivity(correct) {
     if (!sessionId || !user) return;
 
@@ -239,7 +304,9 @@ export default function Train() {
       .eq("id", sessionId);
   }
 
-  // -------- Training --------
+  // -------------------------
+  // Training
+  // -------------------------
   async function check() {
     if (!current) return;
 
@@ -249,6 +316,11 @@ export default function Train() {
 
     setFeedback({ correct, solution: shownSolution, allSolutions: solutions });
 
+    const today = todayYMD();
+
+    // first_seen_date setzen, wenn es eine "neue" Karte ist und noch nie gesehen wurde
+    const setFirstSeen = current.first_seen_date ? {} : { first_seen_date: today };
+
     const { newStage, due_date } = nextStageAndDue(current.stage, correct);
 
     await supabase
@@ -256,13 +328,16 @@ export default function Train() {
       .update({
         stage: newStage,
         due_date,
-        last_seen: todayYMD(),
+        last_seen: today,
         correct_count: (current.correct_count || 0) + (correct ? 1 : 0),
         wrong_count: (current.wrong_count || 0) + (correct ? 0 : 1),
+        ...setFirstSeen,
       })
       .eq("id", current.progress_id);
 
     await markActivity(correct);
+
+    if (user?.id) await refreshCounters(user.id);
   }
 
   async function next() {
@@ -282,7 +357,7 @@ export default function Train() {
     router.push("/");
   }
 
-  // -------- UI: Badge + Balken + Meister --------
+  // UI: Badge + Balken + Meister
   function stageUI(stageRaw) {
     const stage = typeof stageRaw === "number" ? stageRaw : 0;
     const boxNum = Math.min(5, Math.max(1, stage + 1));
@@ -306,18 +381,27 @@ export default function Train() {
         <button onClick={logout}>Logout</button>
       </div>
 
-      <p style={{ color: "#666" }}>{cards.length ? `Karte ${idx + 1} von ${cards.length}` : ""}</p>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", color: "#666" }}>
+        <div>{cards.length ? `Karte ${idx + 1} von ${cards.length}` : ""}</div>
+        <div>
+          Heute noch <b>{newRemainingToday}</b> neue Karten • Fortschritt: <b>{progressPct}%</b>{" "}
+          <span style={{ color: "#888" }}>({masteredCount}/{totalCount} Meister)</span>
+        </div>
+      </div>
+
       {msg && <p style={{ color: "#0a6" }}>{msg}</p>}
 
       {current && (
-        <div style={{ border: "1px solid #ddd", padding: 16, borderRadius: 10 }}>
+        <div style={{ border: "1px solid #ddd", padding: 16, borderRadius: 10, marginTop: 10 }}>
           <div style={{ marginBottom: 12 }}>
             <div style={{ display: "inline-block", padding: "6px 12px", borderRadius: 20, background: ui.bg, color: "#333", fontWeight: 800, fontSize: 14, marginBottom: 10 }}>
               {ui.title}
             </div>
+
             <div style={{ height: 8, background: "#eee", borderRadius: 999, overflow: "hidden" }}>
               <div style={{ height: "100%", width: `${ui.pct}%`, background: ui.bg }} />
             </div>
+
             <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, color: "#777", fontSize: 12 }}>
               <span>Kasten 1</span><span>Kasten 5</span>
             </div>
