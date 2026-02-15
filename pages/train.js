@@ -295,6 +295,16 @@ export default function Train() {
 
       {current && (
         <div style={{ border: "1px solid #ddd", padding: 16, borderRadius: 10 }}>
+        <div
+  style={{
+    fontSize: 14,
+    fontWeight: 600,
+    color: "#666",
+    marginBottom: 8
+  }}
+>
+  Kasten {current.stage + 1} von 5
+</div>
           <div
             style={{
               background: current.is_idiom ? "#fff3b0" : "transparent",
