@@ -3,8 +3,8 @@ import { supabase } from "../lib/supabaseClient";
 import { nextStageAndDue, todayYMD } from "../lib/srs";
 import { useRouter } from "next/router";
 
-const NEW_PER_DAY = 25;        // 👈 hier: 20–30 empfehlenswert
-const SESSION_LIMIT = 20;      // 👈 wie viele Karten pro Session angezeigt werden
+const NEW_PER_DAY = 25;        // 20–30 sinnvoll
+const SESSION_LIMIT = 20;
 
 function addDaysYMD(ymd, days) {
   const [y, m, d] = ymd.split("-").map((x) => parseInt(x, 10));
@@ -48,10 +48,7 @@ export default function Train() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // -------------------------
-  // Schritt 1+2: Vergleichslogik
-  // -------------------------
-
+  // -------- Vergleichslogik (tolerant + Varianten + 1 Tippfehler) --------
   function normalize(text) {
     return (text || "")
       .toLowerCase()
@@ -60,7 +57,6 @@ export default function Train() {
       .replace(/\s+/g, " ")
       .trim();
   }
-
   function canonical(text) {
     let t = normalize(text);
     t = t.replace(/\bim\b/g, "i am");
@@ -69,7 +65,6 @@ export default function Train() {
     t = t.replace(/'/g, "");
     return t;
   }
-
   function levenshtein(a, b) {
     const m = a.length, n = b.length;
     const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
@@ -78,47 +73,32 @@ export default function Train() {
     for (let i = 1; i <= m; i++) {
       for (let j = 1; j <= n; j++) {
         const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-        dp[i][j] = Math.min(
-          dp[i - 1][j] + 1,
-          dp[i][j - 1] + 1,
-          dp[i - 1][j - 1] + cost
-        );
+        dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
       }
     }
     return dp[m][n];
   }
-
   function splitSolutions(englishField) {
     return String(englishField || "")
       .split(";")
       .map((s) => s.trim())
       .filter(Boolean);
   }
-
   function isCorrectAnswer(givenRaw, englishField) {
     const given = canonical(givenRaw);
     const solutionsRaw = splitSolutions(englishField);
 
-    for (const sol of solutionsRaw) {
-      if (given === canonical(sol)) return true;
-    }
+    for (const sol of solutionsRaw) if (given === canonical(sol)) return true;
 
     for (const sol of solutionsRaw) {
       const s = canonical(sol);
       const minLen = Math.min(given.length, s.length);
-      if (minLen >= 5) {
-        const dist = levenshtein(given, s);
-        if (dist <= 1) return true;
-      }
+      if (minLen >= 5 && levenshtein(given, s) <= 1) return true;
     }
-
     return false;
   }
 
-  // -------------------------
-  // Setup: Progress initialisieren (NEU: Neue Karten über Tage verteilen)
-  // -------------------------
-
+  // -------- Setup: Progress initialisieren (NEU: Tag 1→30 zuerst) --------
   async function ensureProgressInitialized(userId) {
     const { count } = await supabase
       .from("progress")
@@ -127,23 +107,23 @@ export default function Train() {
 
     if (count && count > 0) return;
 
-    // Wichtig: Reihenfolge bestimmt, welche Karten zuerst kommen.
-    // Wenn deine Vokabeln in 'vocab' nach Tag 1..30 eingefügt wurden, passt "order('id')" gut.
+    // Tag-Reihenfolge: day asc (nulls last), dann id
+    // Falls day noch leer ist, fällt er automatisch zurück auf id-Reihenfolge.
     const { data: vocab } = await supabase
       .from("vocab")
-      .select("id")
+      .select("id, day")
+      .order("day", { ascending: true, nullsFirst: false })
       .order("id", { ascending: true });
 
     if (!vocab?.length) return;
 
     const start = todayYMD();
-
     const batchSize = 200;
+
     const rows = vocab.map((v, i) => ({
       user_id: userId,
       vocab_id: v.id,
       stage: 0,
-      // 👇 verteilt: 25 neue pro Tag
       due_date: addDaysYMD(start, Math.floor(i / NEW_PER_DAY)),
     }));
 
@@ -152,10 +132,7 @@ export default function Train() {
     }
   }
 
-  // -------------------------
-  // Laden: erst Wiederholungen, dann neue Karten auffüllen (NEU)
-  // -------------------------
-
+  // -------- Laden: erst Wiederholungen, dann neue Karten --------
   async function loadDueCards() {
     setMsg("");
     setFeedback(null);
@@ -164,12 +141,9 @@ export default function Train() {
 
     const today = todayYMD();
 
-    // 1) Wiederholungen (stage > 0)
     const { data: rev, error: revErr } = await supabase
       .from("progress")
-      .select(
-        "id, stage, due_date, correct_count, wrong_count, vocab: vocab_id (id, german, english, is_idiom)"
-      )
+      .select("id, stage, due_date, correct_count, wrong_count, vocab: vocab_id (id, german, english, is_idiom)")
       .lte("due_date", today)
       .gt("stage", 0)
       .order("due_date", { ascending: true })
@@ -189,16 +163,13 @@ export default function Train() {
       is_idiom: p.vocab.is_idiom,
     }));
 
-    // 2) Neue Karten (stage = 0), aber nur bis Session-Limit voll ist
     const remaining = SESSION_LIMIT - mappedRev.length;
 
     let mappedNew = [];
     if (remaining > 0) {
       const { data: neu, error: newErr } = await supabase
         .from("progress")
-        .select(
-          "id, stage, due_date, correct_count, wrong_count, vocab: vocab_id (id, german, english, is_idiom)"
-        )
+        .select("id, stage, due_date, correct_count, wrong_count, vocab: vocab_id (id, german, english, is_idiom)")
         .lte("due_date", today)
         .eq("stage", 0)
         .order("due_date", { ascending: true })
@@ -224,10 +195,7 @@ export default function Train() {
     if (!combined.length) setMsg("Heute ist nichts fällig 🎉");
   }
 
-  // -------------------------
-  // Session Tracking
-  // -------------------------
-
+  // -------- Session Tracking --------
   async function markActivity(correct) {
     if (!sessionId || !user) return;
 
@@ -271,23 +239,15 @@ export default function Train() {
       .eq("id", sessionId);
   }
 
-  // -------------------------
-  // Training
-  // -------------------------
-
+  // -------- Training --------
   async function check() {
     if (!current) return;
 
     const correct = isCorrectAnswer(answer, current.english);
-
     const solutions = splitSolutions(current.english);
     const shownSolution = solutions[0] || current.english;
 
-    setFeedback({
-      correct,
-      solution: shownSolution,
-      allSolutions: solutions,
-    });
+    setFeedback({ correct, solution: shownSolution, allSolutions: solutions });
 
     const { newStage, due_date } = nextStageAndDue(current.stage, correct);
 
@@ -322,24 +282,18 @@ export default function Train() {
     router.push("/");
   }
 
-  // -------------------------
-  // UI: Kasten-Badge + Balken + Meister
-  // -------------------------
-
+  // -------- UI: Badge + Balken + Meister --------
   function stageUI(stageRaw) {
-    const stage = typeof stageRaw === "number" ? stageRaw : 0; // 0..4
+    const stage = typeof stageRaw === "number" ? stageRaw : 0;
     const boxNum = Math.min(5, Math.max(1, stage + 1));
     const pct = ((boxNum - 1) / 4) * 100;
-
     const bg =
       stage === 0 ? "#f8d7da" :
       stage === 1 ? "#fff3cd" :
       stage === 2 ? "#d1ecf1" :
       stage === 3 ? "#d4edda" :
       "#c3e6cb";
-
     const title = stage === 4 ? `🏆 Meister (Kasten ${boxNum}/5)` : `📦 Kasten ${boxNum} von 5`;
-
     return { bg, pct, title };
   }
 
@@ -358,40 +312,18 @@ export default function Train() {
       {current && (
         <div style={{ border: "1px solid #ddd", padding: 16, borderRadius: 10 }}>
           <div style={{ marginBottom: 12 }}>
-            <div
-              style={{
-                display: "inline-block",
-                padding: "6px 12px",
-                borderRadius: 20,
-                background: ui.bg,
-                color: "#333",
-                fontWeight: 800,
-                fontSize: 14,
-                marginBottom: 10,
-              }}
-            >
+            <div style={{ display: "inline-block", padding: "6px 12px", borderRadius: 20, background: ui.bg, color: "#333", fontWeight: 800, fontSize: 14, marginBottom: 10 }}>
               {ui.title}
             </div>
-
             <div style={{ height: 8, background: "#eee", borderRadius: 999, overflow: "hidden" }}>
               <div style={{ height: "100%", width: `${ui.pct}%`, background: ui.bg }} />
             </div>
-
             <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, color: "#777", fontSize: 12 }}>
-              <span>Kasten 1</span>
-              <span>Kasten 5</span>
+              <span>Kasten 1</span><span>Kasten 5</span>
             </div>
           </div>
 
-          <div
-            style={{
-              background: current.is_idiom ? "#fff3b0" : "transparent",
-              padding: 10,
-              borderRadius: 8,
-              fontSize: 20,
-              marginBottom: 12,
-            }}
-          >
+          <div style={{ background: current.is_idiom ? "#fff3b0" : "transparent", padding: 10, borderRadius: 8, fontSize: 20, marginBottom: 12 }}>
             {current.german}
           </div>
 
@@ -405,9 +337,7 @@ export default function Train() {
           />
 
           {!feedback ? (
-            <button onClick={check} style={{ padding: "10px 14px" }}>
-              Prüfen
-            </button>
+            <button onClick={check} style={{ padding: "10px 14px" }}>Prüfen</button>
           ) : (
             <div style={{ marginTop: 12 }}>
               <p style={{ fontWeight: 800, color: feedback.correct ? "#0a6" : "#b00" }}>
@@ -416,9 +346,7 @@ export default function Train() {
 
               {!feedback.correct && (
                 <>
-                  <p>
-                    Richtige Lösung: <b>{feedback.solution}</b>
-                  </p>
+                  <p>Richtige Lösung: <b>{feedback.solution}</b></p>
                   {feedback.allSolutions?.length > 1 && (
                     <p style={{ color: "#666", marginTop: 6 }}>
                       Weitere akzeptierte Lösungen: <b>{feedback.allSolutions.slice(1).join(" • ")}</b>
@@ -427,21 +355,15 @@ export default function Train() {
                 </>
               )}
 
-              <button onClick={next} style={{ padding: "10px 14px" }}>
-                Nächste
-              </button>
+              <button onClick={next} style={{ padding: "10px 14px" }}>Nächste</button>
             </div>
           )}
         </div>
       )}
 
       <div style={{ marginTop: 16 }}>
-        <button onClick={loadDueCards} style={{ padding: "10px 14px" }}>
-          Fällige neu laden
-        </button>{" "}
-        <a href="/admin" style={{ marginLeft: 10 }}>
-          Admin
-        </a>
+        <button onClick={loadDueCards} style={{ padding: "10px 14px" }}>Fällige neu laden</button>{" "}
+        <a href="/admin" style={{ marginLeft: 10 }}>Admin</a>
       </div>
     </main>
   );
