@@ -1,226 +1,154 @@
-import { useEffect, useMemo, useState } from "react";
-import { supabase } from "../lib/supabaseClient";
-import { useRouter } from "next/router";
+import { createClient } from "@supabase/supabase-js";
 
-function fmtDateTime(iso) {
-  if (!iso) return "-";
-  const d = new Date(iso);
-  return d.toLocaleString();
+const NEW_PER_DAY = 25; // muss zu train.js passen
+
+function ymd(d) {
+  const x = new Date(d);
+  const y = x.getFullYear();
+  const m = String(x.getMonth() + 1).padStart(2, "0");
+  const day = String(x.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
-export default function Admin() {
-  const router = useRouter();
-  const [msg, setMsg] = useState("Lade…");
-  const [data, setData] = useState(null);
-  const [filter, setFilter] = useState("");
+export default async function handler(req, res) {
+  try {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  useEffect(() => {
-    (async () => {
-      const { data: sess } = await supabase.auth.getSession();
-      if (!sess.session) return router.push("/");
+    if (!url || !serviceKey) {
+      return res.status(500).json({ error: "Server-Konfiguration fehlt (Supabase Keys)." });
+    }
 
-      const token = sess.session.access_token;
+    const supabaseAdmin = createClient(url, serviceKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
 
-      const r = await fetch("/api/admin/overview", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "Kein Token." });
 
-      const j = await r.json();
-      if (!r.ok) {
-        setMsg(j?.error || "Kein Zugriff / Fehler.");
-        return;
+    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
+    if (userErr || !userData?.user) return res.status(401).json({ error: "Token ungültig." });
+
+    const adminUserId = userData.user.id;
+
+    // Admin-Check
+    const { data: adminRow, error: adminCheckErr } = await supabaseAdmin
+      .from("admins")
+      .select("user_id")
+      .eq("user_id", adminUserId)
+      .maybeSingle();
+
+    if (adminCheckErr) return res.status(500).json({ error: "Admin-Check fehlgeschlagen." });
+    if (!adminRow) return res.status(403).json({ error: "Kein Admin-Zugriff." });
+
+    // Students
+    const { data: students, error: stuErr } = await supabaseAdmin
+      .from("students")
+      .select("id, auth_user_id, username, display_name, class_name")
+      .order("username", { ascending: true });
+
+    if (stuErr) return res.status(500).json({ error: "Students konnten nicht geladen werden." });
+
+    const today = new Date();
+    const todayStr = ymd(today);
+
+    const since30 = new Date(today);
+    since30.setDate(since30.getDate() - 30);
+    const since30ISO = since30.toISOString();
+
+    const since7 = new Date(today);
+    since7.setDate(since7.getDate() - 7);
+    const since7ISO = since7.toISOString();
+
+    const result = [];
+
+    for (const s of students || []) {
+      // Progress für Stage-Verteilung + due + neu-heute + meister
+      const { data: progRows, error: progErr } = await supabaseAdmin
+        .from("progress")
+        .select("stage, due_date, first_seen_date")
+        .eq("user_id", s.auth_user_id);
+
+      if (progErr) {
+        result.push({ student: s, error: "progress_error" });
+        continue;
       }
 
-      setData(j);
-      setMsg("");
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+      const stageCounts = [0, 0, 0, 0, 0];
+      let dueNow = 0;
+      let newToday = 0;
 
-  const rows = useMemo(() => {
-    const all = data?.students || [];
-    if (!filter.trim()) return all;
-    const f = filter.trim().toLowerCase();
-    return all.filter((x) => {
-      const u = x.student?.username || "";
-      const n = x.student?.display_name || "";
-      const c = x.student?.class_name || "";
-      return `${u} ${n} ${c}`.toLowerCase().includes(f);
-    });
-  }, [data, filter]);
+      for (const p of progRows || []) {
+        const st = typeof p.stage === "number" ? p.stage : 0;
+        if (st >= 0 && st <= 4) stageCounts[st] += 1;
 
-  async function logout() {
-    await supabase.auth.signOut();
-    router.push("/");
+        if (p.due_date && String(p.due_date) <= todayStr) dueNow += 1;
+        if (p.first_seen_date && String(p.first_seen_date) === todayStr) newToday += 1;
+      }
+
+      const totalCards = stageCounts.reduce((a, b) => a + b, 0);
+      const mastered = stageCounts[4];
+      const progressPct = totalCards > 0 ? Math.round((mastered / totalCards) * 100) : 0;
+      const newRemainingToday = Math.max(0, NEW_PER_DAY - newToday);
+
+      // Practice Sessions (letzte 30 Tage) → pro Tag aggregieren
+      const { data: sessRows, error: sessErr } = await supabaseAdmin
+        .from("practice_sessions")
+        .select("started_at, ended_at, duration_seconds, cards_answered, correct_answers, wrong_answers, last_activity_at")
+        .eq("user_id", s.auth_user_id)
+        .gte("started_at", since30ISO)
+        .order("started_at", { ascending: false });
+
+      let days = [];
+      let lastPracticeAt = null;
+      let minutes7d = 0;
+      let daysPracticed7d = 0;
+
+      if (!sessErr) {
+        const dayMap = new Map();
+        for (const r of sessRows || []) {
+          const key = ymd(r.started_at || r.last_activity_at || new Date().toISOString());
+          const prev = dayMap.get(key) || { date: key, seconds: 0, cards: 0, correct: 0, wrong: 0 };
+          prev.seconds += Number(r.duration_seconds || 0);
+          prev.cards += Number(r.cards_answered || 0);
+          prev.correct += Number(r.correct_answers || 0);
+          prev.wrong += Number(r.wrong_answers || 0);
+          dayMap.set(key, prev);
+
+          if (!lastPracticeAt) lastPracticeAt = r.last_activity_at || r.ended_at || r.started_at || null;
+        }
+        days = Array.from(dayMap.values()).sort((a, b) => (a.date < b.date ? 1 : -1));
+
+        const practiced7dSet = new Set();
+        let seconds7d = 0;
+        for (const r of sessRows || []) {
+          const sa = r.started_at || r.last_activity_at;
+          if (!sa) continue;
+          if (new Date(sa).toISOString() >= since7ISO) {
+            seconds7d += Number(r.duration_seconds || 0);
+            practiced7dSet.add(ymd(sa));
+          }
+        }
+        minutes7d = Math.round(seconds7d / 60);
+        daysPracticed7d = practiced7dSet.size;
+      }
+
+      result.push({
+        student: s,
+        totalCards,
+        stageCounts,
+        dueNow,
+        mastered,
+        progressPct,
+        newToday,
+        newRemainingToday,
+        activity: { days, lastPracticeAt, minutes7d, daysPracticed7d },
+      });
+    }
+
+    return res.status(200).json({ today: todayStr, newPerDay: NEW_PER_DAY, students: result });
+  } catch (e) {
+    return res.status(500).json({ error: "Serverfehler." });
   }
-
-  return (
-    <main style={{ maxWidth: 1100, margin: "40px auto", fontFamily: "system-ui" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-        <h1>Admin</h1>
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <a href="/train">← Training</a>
-          <button onClick={logout}>Logout</button>
-        </div>
-      </div>
-
-      {msg && <p style={{ color: msg.includes("Kein") ? "#b00" : "#666" }}>{msg}</p>}
-
-      {data && (
-        <>
-          <p style={{ color: "#666" }}>
-            Stand: <b>{data.today}</b> • Schüler: <b>{rows.length}</b>
-          </p>
-
-          <div style={{ margin: "14px 0" }}>
-            <input
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder="Suche: username / Name / Klasse"
-              style={{ width: "100%", padding: 10, fontSize: 14 }}
-            />
-          </div>
-
-          <div style={{ overflowX: "auto", border: "1px solid #eee", borderRadius: 10 }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 980 }}>
-              <thead>
-                <tr style={{ background: "#fafafa" }}>
-                  <th style={th}>Username</th>
-                  <th style={th}>Name</th>
-                  <th style={th}>Klasse</th>
-                  <th style={th}>Fällig heute</th>
-                  <th style={th}>Karten gesamt</th>
-                  <th style={th}>Meister (K5)</th>
-                  <th style={th}>Kasten 1–5</th>
-                  <th style={th}>Letztes Üben</th>
-                  <th style={th}>Üben (7 Tage)</th>
-                  <th style={th}>Tage (7)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r) => {
-                  const s = r.student;
-                  const sc = r.stageCounts || [0, 0, 0, 0, 0];
-                  const boxText = `1:${sc[0]}  2:${sc[1]}  3:${sc[2]}  4:${sc[3]}  5:${sc[4]}`;
-                  return (
-                    <tr key={s.auth_user_id}>
-                      <td style={td}><b>{s.username}</b></td>
-                      <td style={td}>{s.display_name || "-"}</td>
-                      <td style={td}>{s.class_name || "-"}</td>
-                      <td style={td}><b>{r.dueNow ?? "-"}</b></td>
-                      <td style={td}>{r.totalCards ?? "-"}</td>
-                      <td style={td}>{r.mastered ?? 0}</td>
-                      <td style={td} title={boxText}>
-                        <MiniBars counts={sc} />
-                      </td>
-                      <td style={td}>{fmtDateTime(r.activity?.lastPracticeAt)}</td>
-                      <td style={td}>{r.activity?.minutes7d ?? 0} min</td>
-                      <td style={td}>{r.activity?.daysPracticed7d ?? 0}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-
-          <h2 style={{ marginTop: 26 }}>Übungstage & Dauer (letzte 30 Tage)</h2>
-          <p style={{ color: "#666" }}>
-            Tipp: Suche oben einen Schüler und scrolle dann hier – pro Schüler siehst du die Tageswerte.
-          </p>
-
-          {rows.map((r) => {
-            const s = r.student;
-            const days = r.activity?.days || [];
-            return (
-              <div key={s.auth_user_id} style={{ border: "1px solid #eee", borderRadius: 10, padding: 12, marginTop: 12 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
-                  <div>
-                    <b>{s.username}</b> {s.display_name ? `(${s.display_name})` : ""} {s.class_name ? `• ${s.class_name}` : ""}
-                  </div>
-                  <div style={{ color: "#666" }}>
-                    7 Tage: <b>{r.activity?.minutes7d ?? 0} min</b> • Übungstage: <b>{r.activity?.daysPracticed7d ?? 0}</b>
-                  </div>
-                </div>
-
-                {!days.length ? (
-                  <p style={{ color: "#666", marginTop: 8 }}>Keine Sessions in den letzten 30 Tagen.</p>
-                ) : (
-                  <div style={{ overflowX: "auto", marginTop: 8 }}>
-                    <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 650 }}>
-                      <thead>
-                        <tr style={{ background: "#fafafa" }}>
-                          <th style={th}>Tag</th>
-                          <th style={th}>Dauer</th>
-                          <th style={th}>Karten</th>
-                          <th style={th}>Richtig</th>
-                          <th style={th}>Falsch</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {days.slice(0, 14).map((d) => (
-                          <tr key={d.date}>
-                            <td style={td}><b>{d.date}</b></td>
-                            <td style={td}>{Math.round((d.seconds || 0) / 60)} min</td>
-                            <td style={td}>{d.cards || 0}</td>
-                            <td style={td}>{d.correct || 0}</td>
-                            <td style={td}>{d.wrong || 0}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    <p style={{ color: "#777", marginTop: 8, fontSize: 12 }}>
-                      Anzeige: die letzten 14 Tage (von insgesamt bis zu 30 Tagen).
-                    </p>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </>
-      )}
-    </main>
-  );
 }
-
-function MiniBars({ counts }) {
-  const total = (counts || []).reduce((a, b) => a + b, 0) || 1;
-
-  const parts = [
-    { v: counts?.[0] || 0, bg: "#f8d7da" }, // K1 rot
-    { v: counts?.[1] || 0, bg: "#fff3cd" }, // K2 gelb
-    { v: counts?.[2] || 0, bg: "#d1ecf1" }, // K3 blau
-    { v: counts?.[3] || 0, bg: "#d4edda" }, // K4 grün
-    { v: counts?.[4] || 0, bg: "#c3e6cb" }, // K5 grün+
-  ];
-
-  return (
-    <div style={{ display: "flex", height: 12, borderRadius: 999, overflow: "hidden", background: "#eee", minWidth: 180 }}>
-      {parts.map((p, i) => (
-        <div
-          key={i}
-          style={{
-            width: `${Math.round((p.v / total) * 100)}%`,
-            background: p.bg,
-          }}
-          title={`Kasten ${i + 1}: ${p.v}`}
-        />
-      ))}
-    </div>
-  );
-}
-
-const th = {
-  textAlign: "left",
-  padding: "10px 10px",
-  fontSize: 13,
-  borderBottom: "1px solid #eee",
-  whiteSpace: "nowrap",
-};
-
-const td = {
-  padding: "10px 10px",
-  fontSize: 13,
-  borderBottom: "1px solid #f0f0f0",
-  verticalAlign: "top",
-  whiteSpace: "nowrap",
-};
