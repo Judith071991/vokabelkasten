@@ -35,6 +35,87 @@ export default function Train() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // -------------------------
+  // Schritt 1+2: Vergleichslogik
+  // -------------------------
+
+  function normalize(text) {
+    return (text || "")
+      .toLowerCase()
+      .replace(/[’‘]/g, "'") // geschwungene Apostrophe → '
+      .replace(/[“”]/g, '"') // geschwungene Anführungszeichen → "
+      .replace(/\s+/g, " ") // mehrere Leerzeichen → eins
+      .trim();
+  }
+
+  // Canonical: macht Varianten möglichst gleich
+  // - i'm / i’m / im / i am → i am
+  // - apostrophe egal
+  function canonical(text) {
+    let t = normalize(text);
+    t = t.replace(/\bim\b/g, "i am");
+    t = t.replace(/\bi'm\b/g, "i am");
+    t = t.replace(/\bi’m\b/g, "i am"); // falls typografisch drin bleibt
+    t = t.replace(/'/g, "");
+    return t;
+  }
+
+  // Levenshtein-Distanz (für 1 kleinen Tippfehler)
+  function levenshtein(a, b) {
+    const m = a.length,
+      n = b.length;
+    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+    for (let i = 0; i <= m; i++) dp[i][0] = i;
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        dp[i][j] = Math.min(
+          dp[i - 1][j] + 1,
+          dp[i][j - 1] + 1,
+          dp[i - 1][j - 1] + cost
+        );
+      }
+    }
+    return dp[m][n];
+  }
+
+  // Step 2: Mehrere Lösungen erlauben:
+  // current.english kann Varianten enthalten, getrennt durch ';'
+  function splitSolutions(englishField) {
+    return String(englishField || "")
+      .split(";")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  function isCorrectAnswer(givenRaw, englishField) {
+    const given = canonical(givenRaw);
+    const solutionsRaw = splitSolutions(englishField);
+
+    // Erst: exakter Match nach canonical gegen irgendeine Lösung
+    for (const sol of solutionsRaw) {
+      if (given === canonical(sol)) return true;
+    }
+
+    // Dann: 1 Tippfehler erlauben (nur wenn nicht zu kurz)
+    // Damit "to" nicht versehentlich alles matcht.
+    for (const sol of solutionsRaw) {
+      const s = canonical(sol);
+      const minLen = Math.min(given.length, s.length);
+      if (minLen >= 5) {
+        const dist = levenshtein(given, s);
+        if (dist <= 1) return true;
+      }
+    }
+
+    return false;
+  }
+
+  // -------------------------
+  // Datenladen / Setup
+  // -------------------------
+
   async function ensureProgressInitialized(userId) {
     const { count } = await supabase
       .from("progress")
@@ -68,12 +149,15 @@ export default function Train() {
 
     const { data, error } = await supabase
       .from("progress")
-      .select("id, stage, due_date, correct_count, wrong_count, vocab: vocab_id (id, german, english, is_idiom)")
+      .select(
+        "id, stage, due_date, correct_count, wrong_count, vocab: vocab_id (id, german, english, is_idiom)"
+      )
       .lte("due_date", today)
       .order("due_date", { ascending: true })
       .limit(20);
 
     if (error) return setMsg("Fehler beim Laden.");
+
     const mapped = (data || []).map((p) => ({
       progress_id: p.id,
       stage: p.stage,
@@ -89,6 +173,10 @@ export default function Train() {
     setCards(mapped);
     if (!mapped.length) setMsg("Heute ist nichts fällig 🎉");
   }
+
+  // -------------------------
+  // Session Tracking (Übungszeit)
+  // -------------------------
 
   async function markActivity(correct) {
     if (!sessionId || !user) return;
@@ -108,51 +196,6 @@ export default function Train() {
         wrong_answers: (s?.wrong_answers || 0) + (correct ? 0 : 1),
       })
       .eq("id", sessionId);
-  }
-
-  async function check() {
-  if (!current) return;
-
-  function normalize(text) {
-    return (text || "")
-      .toLowerCase()
-      .replace(/[’‘]/g, "'")     // geschwungene Apostrophe → '
-      .replace(/[“”]/g, '"')     // geschwungene Anführungszeichen → "
-      .replace(/\s+/g, " ")      // mehrere Leerzeichen → eins
-      .trim();
-  }
-
-  const given = normalize(answer);
-  const solution = normalize(current.english);
-  const correct = given === solution;
-
-  setFeedback({ correct, solution: current.english });
-
-  const { newStage, due_date } = nextStageAndDue(current.stage, correct);
-
-  await supabase
-    .from("progress")
-    .update({
-      stage: newStage,
-      due_date,
-      last_seen: todayYMD(),
-      correct_count: (current.correct_count || 0) + (correct ? 1 : 0),
-      wrong_count: (current.wrong_count || 0) + (correct ? 0 : 1),
-    })
-    .eq("id", current.progress_id);
-
-  await markActivity(correct);
-}
-
-  async function next() {
-    setFeedback(null);
-    setAnswer("");
-    if (idx + 1 < cards.length) setIdx(idx + 1);
-    else {
-      setMsg("Session fertig ✅");
-      await endSession();
-      await loadDueCards();
-    }
   }
 
   async function endSession() {
@@ -178,11 +221,63 @@ export default function Train() {
       .eq("id", sessionId);
   }
 
+  // -------------------------
+  // Training: Prüfen / Nächste / Logout
+  // -------------------------
+
+  async function check() {
+    if (!current) return;
+
+    const correct = isCorrectAnswer(answer, current.english);
+
+    // Für Feedback: zeige erste Lösung (oder ganze Liste)
+    const solutions = splitSolutions(current.english);
+    const shownSolution = solutions[0] || current.english;
+
+    setFeedback({
+      correct,
+      solution: shownSolution,
+      allSolutions: solutions,
+    });
+
+    const { newStage, due_date } = nextStageAndDue(current.stage, correct);
+
+    await supabase
+      .from("progress")
+      .update({
+        stage: newStage,
+        due_date,
+        last_seen: todayYMD(),
+        correct_count: (current.correct_count || 0) + (correct ? 1 : 0),
+        wrong_count: (current.wrong_count || 0) + (correct ? 0 : 1),
+      })
+      .eq("id", current.progress_id);
+
+    await markActivity(correct);
+  }
+
+  async function next() {
+    setFeedback(null);
+    setAnswer("");
+    if (idx + 1 < cards.length) setIdx(idx + 1);
+    else {
+      setMsg("Session fertig ✅");
+      await endSession();
+      await loadDueCards();
+    }
+  }
+
   async function logout() {
     await endSession();
     await supabase.auth.signOut();
     router.push("/");
   }
+
+  // -------------------------
+  // UI (Schritt 3: Stufe anzeigen)
+  // -------------------------
+
+  const stageLabel = current ? `Kasten ${current.stage + 1} / 5` : "";
 
   return (
     <main style={{ maxWidth: 720, margin: "40px auto", fontFamily: "system-ui" }}>
@@ -191,7 +286,11 @@ export default function Train() {
         <button onClick={logout}>Logout</button>
       </div>
 
-      <p style={{ color: "#666" }}>{cards.length ? `Karte ${idx + 1} von ${cards.length}` : ""}</p>
+      <p style={{ color: "#666" }}>
+        {cards.length ? `Karte ${idx + 1} von ${cards.length}` : ""}
+        {current ? ` • ${stageLabel}` : ""}
+      </p>
+
       {msg && <p style={{ color: "#0a6" }}>{msg}</p>}
 
       {current && (
@@ -226,11 +325,21 @@ export default function Train() {
               <p style={{ fontWeight: 700, color: feedback.correct ? "#0a6" : "#b00" }}>
                 {feedback.correct ? "Richtig ✅" : "Falsch ❌"}
               </p>
+
               {!feedback.correct && (
-                <p>
-                  Richtige Lösung: <b>{feedback.solution}</b>
-                </p>
+                <>
+                  <p>
+                    Richtige Lösung: <b>{feedback.solution}</b>
+                  </p>
+                  {feedback.allSolutions?.length > 1 && (
+                    <p style={{ color: "#666", marginTop: 6 }}>
+                      Weitere akzeptierte Lösungen:{" "}
+                      <b>{feedback.allSolutions.slice(1).join(" • ")}</b>
+                    </p>
+                  )}
+                </>
               )}
+
               <button onClick={next} style={{ padding: "10px 14px" }}>
                 Nächste
               </button>
